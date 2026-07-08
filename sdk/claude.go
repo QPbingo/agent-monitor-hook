@@ -149,11 +149,13 @@ func (c *ClaudeSDK) SendPrompt(ctx context.Context, sessionID string, prompt str
 				continue
 			}
 
-			msg := c.parseMessage(raw, sessionID)
-			select {
-			case ch <- msg:
-			case <-ctx.Done():
-				return
+			msgs := c.parseMessage(raw, sessionID)
+			for _, msg := range msgs {
+				select {
+				case ch <- msg:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 
@@ -212,71 +214,118 @@ func (c *ClaudeSDK) buildEnv(extra map[string]string) []string {
 	return env
 }
 
-// parseMessage converts a raw stream-json line into a Message.
-func (c *ClaudeSDK) parseMessage(raw map[string]interface{}, sessionID string) Message {
-	msg := Message{
+// parseMessage converts a raw stream-json line into zero or more Messages.
+// A single "assistant" line can carry multiple content blocks (text mixed
+// with one or more tool_use blocks, e.g. parallel tool calls) — see
+// parseAssistantMessage. Every other line type maps to exactly one Message,
+// as before.
+func (c *ClaudeSDK) parseMessage(raw map[string]interface{}, sessionID string) []Message {
+	rawJSON, _ := json.Marshal(raw)
+	base := Message{
 		SessionID: sessionID,
 		Timestamp: time.Now(),
-	}
-	if b, err := json.Marshal(raw); err == nil {
-		msg.RawJSON = b
+		RawJSON:   rawJSON,
 	}
 
 	msgType, _ := raw["type"].(string)
 	switch msgType {
 	case "assistant":
-		msg.Type = MessageTypeText
-		if msgBlock, ok := raw["message"].(map[string]interface{}); ok {
-			if content, ok := msgBlock["content"].([]interface{}); ok && len(content) > 0 {
-				var parts []string
-				for _, block := range content {
-					if textBlock, ok := block.(map[string]interface{}); ok {
-						if text, ok := textBlock["text"].(string); ok && text != "" {
-							parts = append(parts, text)
-						}
-					}
-				}
-				msg.Content = strings.Join(parts, "\n")
-			}
-		}
+		return c.parseAssistantMessage(raw, base)
 	case "user":
-		msg.Type = MessageTypeSystem
+		m := base
+		m.Type = MessageTypeSystem
+		return []Message{m}
 	case "result":
-		msg.Type = MessageTypeResult
-		msg.IsFinal = true
+		m := base
+		m.Type = MessageTypeResult
+		m.IsFinal = true
 		if result, ok := raw["result"].(string); ok {
-			msg.Content = result
+			m.Content = result
 		}
-		if msg.Content == "" {
+		if m.Content == "" {
 			if stopReason, ok := raw["stop_reason"].(string); ok {
-				msg.Content = stopReason
+				m.Content = stopReason
 			}
 		}
+		return []Message{m}
 	case "system":
-		msg.Type = MessageTypeSystem
+		m := base
+		m.Type = MessageTypeSystem
 		if subtype, ok := raw["subtype"].(string); ok && subtype == "init" {
 			if data, ok := raw["data"].(map[string]interface{}); ok {
 				if sid, ok := data["session_id"].(string); ok {
-					msg.SessionID = sid
-					msg.Content = "session:" + sid
+					m.SessionID = sid
+					m.Content = "session:" + sid
 				}
 			}
 		}
-	case "tool_use":
-		msg.Type = MessageTypeToolUse
-		if name, ok := raw["name"].(string); ok {
-			msg.ToolName = name
-		}
-		if input, ok := raw["input"].(map[string]interface{}); ok {
-			if b, err := json.Marshal(input); err == nil {
-				msg.ToolInput = string(b)
-			}
-		}
+		return []Message{m}
 	default:
-		msg.Type = MessageTypeSystem
+		m := base
+		m.Type = MessageTypeSystem
+		return []Message{m}
+	}
+}
+
+// parseAssistantMessage extracts one Message per content block from an
+// "assistant" stream-json line. Claude Code's message.content[] array mixes
+// text blocks and tool_use blocks in a single line (confirmed against real
+// `claude --output-format stream-json` output, see plan Task 5) — a
+// 1-line-in/1-message-out mapping would silently drop every block but the
+// first text one. Each block becomes its own Message with a shared
+// RawJSON/SessionID/Timestamp (base), so downstream consumers (SSE
+// broadcast, RecordSDKMessage -> ToolCall) see every block, in order.
+func (c *ClaudeSDK) parseAssistantMessage(raw map[string]interface{}, base Message) []Message {
+	msgBlock, ok := raw["message"].(map[string]interface{})
+	if !ok {
+		m := base
+		m.Type = MessageTypeText
+		return []Message{m}
+	}
+	content, ok := msgBlock["content"].([]interface{})
+	if !ok || len(content) == 0 {
+		m := base
+		m.Type = MessageTypeText
+		return []Message{m}
 	}
 
-	return msg
+	var out []Message
+	for _, block := range content {
+		b, ok := block.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		blockType, _ := b["type"].(string)
+		switch blockType {
+		case "text":
+			text, _ := b["text"].(string)
+			if text == "" {
+				continue
+			}
+			m := base
+			m.Type = MessageTypeText
+			m.Content = text
+			out = append(out, m)
+		case "tool_use":
+			m := base
+			m.Type = MessageTypeToolUse
+			if name, ok := b["name"].(string); ok {
+				m.ToolName = name
+			}
+			if input, ok := b["input"].(map[string]interface{}); ok {
+				if ib, err := json.Marshal(input); err == nil {
+					m.ToolInput = string(ib)
+				}
+			}
+			out = append(out, m)
+		}
+	}
+	if len(out) == 0 {
+		m := base
+		m.Type = MessageTypeText
+		out = append(out, m)
+	}
+	return out
 }
 
 // ResumeSession returns metadata for an existing session.
